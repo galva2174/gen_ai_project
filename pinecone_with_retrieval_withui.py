@@ -1,151 +1,110 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 1,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stderr",
-     "output_type": "stream",
-     "text": [
-      "c:\\Users\\HP World\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\tqdm\\auto.py:21: TqdmWarning: IProgress not found. Please update jupyter and ipywidgets. See https://ipywidgets.readthedocs.io/en/stable/user_install.html\n",
-      "  from .autonotebook import tqdm as notebook_tqdm\n"
-     ]
-    }
-   ],
-   "source": [
-    "import streamlit as st\n",
-    "import numpy as np\n",
-    "from youtube_transcript_api import YouTubeTranscriptApi\n",
-    "from youtube_transcript_api.formatters import TextFormatter\n",
-    "from sentence_transformers import SentenceTransformer\n",
-    "from pinecone import Pinecone\n",
-    "\n",
-    "# Initialize Pinecone\n",
-    "pc = Pinecone(api_key=\"pcsk_3rWW1w_Eua9C9tD1rbQybpChVD9nDijUycon7auXNs3afy7T2Z2zK2YnSHEFeLmKJsx4pp\", region=\"us-east-1\")\n",
-    "\n",
-    "# Connect to or create your Pinecone index\n",
-    "index_name = \"video-embeddings\"\n",
-    "index = pc.Index(index_name)\n",
-    "\n",
-    "# Load Sentence Transformer model\n",
-    "model = SentenceTransformer(\"all-MiniLM-L6-v2\")\n",
-    "\n",
-    "def extract_transcript(video_id):\n",
-    "    \"\"\"Extracts transcript from a YouTube video.\"\"\"\n",
-    "    try:\n",
-    "        transcript = YouTubeTranscriptApi.get_transcript(video_id)\n",
-    "        formatter = TextFormatter()\n",
-    "        return formatter.format_transcript(transcript)\n",
-    "    except Exception as e:\n",
-    "        st.error(f\"Error fetching transcript: {e}\")\n",
-    "        return None\n",
-    "\n",
-    "def get_embedding(text):\n",
-    "    \"\"\"Generates an embedding using Sentence Transformers.\"\"\"\n",
-    "    return model.encode(text).tolist()\n",
-    "\n",
-    "def generate_embeddings(video_id):\n",
-    "    \"\"\"Generates embeddings from a YouTube video transcript.\"\"\"\n",
-    "    transcript = extract_transcript(video_id)\n",
-    "    if not transcript:\n",
-    "        return None, None\n",
-    "\n",
-    "    lines = transcript.split(\"\\n\")\n",
-    "    chunk_size = 5  # Adjust chunk size\n",
-    "    text_chunks = [\" \".join(lines[i:i+chunk_size]) for i in range(0, len(lines), chunk_size)]\n",
-    "\n",
-    "    embeddings = np.array([get_embedding(chunk) for chunk in text_chunks], dtype=np.float32)\n",
-    "    return embeddings, text_chunks  # Return both embeddings and text chunks\n",
-    "\n",
-    "def store_embeddings_in_pinecone(embeddings, text_chunks, video_id):\n",
-    "    \"\"\"Stores embeddings in Pinecone index.\"\"\"\n",
-    "    if embeddings is not None:\n",
-    "        ids = [f\"{video_id}_{i}\" for i in range(len(embeddings))]\n",
-    "\n",
-    "        # Prepare data for Pinecone (storing text as metadata)\n",
-    "        data = [\n",
-    "            (ids[i], embeddings[i].tolist(), {\"text\": text_chunks[i]})\n",
-    "            for i in range(len(embeddings))\n",
-    "        ]\n",
-    "\n",
-    "        # Upsert the embeddings into Pinecone\n",
-    "        index.upsert(vectors=data)\n",
-    "        st.success(f\"Successfully upserted {len(data)} embeddings into Pinecone.\")\n",
-    "\n",
-    "def search_transcript(user_query, top_k=5):\n",
-    "    \"\"\"Searches Pinecone for relevant transcript sections based on a user query.\"\"\"\n",
-    "    \n",
-    "    # Step 1: Convert query to embedding\n",
-    "    query_embedding = get_embedding(user_query)\n",
-    "\n",
-    "    # Step 2: Search Pinecone\n",
-    "    result = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)\n",
-    "\n",
-    "    # Step 3: Extract relevant text sections\n",
-    "    retrieved_texts = [match.metadata[\"text\"] for match in result[\"matches\"] if match.metadata and \"text\" in match.metadata]\n",
-    "\n",
-    "    return retrieved_texts\n",
-    "\n",
-    "# Streamlit UI\n",
-    "def main():\n",
-    "    st.title(\"YouTube Video Transcript Search\")\n",
-    "\n",
-    "    # Input for YouTube video ID\n",
-    "    yt_video_id = st.text_input(\"Enter YouTube Video ID\", \"\")\n",
-    "\n",
-    "    # Input for user query\n",
-    "    user_query = st.text_input(\"Enter your question\", \"\")\n",
-    "\n",
-    "    if yt_video_id and user_query:\n",
-    "        st.write(f\"Searching for: `{user_query}` in video `{yt_video_id}`...\")\n",
-    "\n",
-    "        # Generate embeddings and text chunks\n",
-    "        embeddings, text_chunks = generate_embeddings(yt_video_id)\n",
-    "\n",
-    "        if embeddings and text_chunks:\n",
-    "            # Store embeddings in Pinecone\n",
-    "            store_embeddings_in_pinecone(embeddings, text_chunks, yt_video_id)\n",
-    "\n",
-    "            # Retrieve most relevant transcript sections\n",
-    "            relevant_sections = search_transcript(user_query)\n",
-    "\n",
-    "            st.subheader(\"🔹 Most Relevant Transcript Sections:\")\n",
-    "            if relevant_sections:\n",
-    "                for idx, section in enumerate(relevant_sections, 1):\n",
-    "                    st.write(f\"{idx}. {section}\\n\")\n",
-    "            else:\n",
-    "                st.write(\"No matching transcript sections found.\")\n",
-    "        else:\n",
-    "            st.write(\"Failed to generate embeddings. Please check the YouTube video ID.\")\n",
-    "    else:\n",
-    "        st.write(\"Please enter a YouTube video ID and a query to start the search.\")\n",
-    "\n",
-    "if __name__ == \"__main__\":\n",
-    "    main()\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.12.5"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 2
-}
+import streamlit as st
+import numpy as np
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone
+
+# Initialize Pinecone
+pc = Pinecone(api_key="pcsk_3rWW1w_Eua9C9tD1rbQybpChVD9nDijUycon7auXNs3afy7T2Z2zK2YnSHEFeLmKJsx4pp", region="us-east-1")
+
+# Connect to or create your Pinecone index
+index_name = "video-embeddings"
+index = pc.Index(index_name)
+
+# Load Sentence Transformer model
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def extract_transcript(video_id):
+    """Extracts transcript from a YouTube video."""
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        formatter = TextFormatter()
+        return formatter.format_transcript(transcript)
+    except Exception as e:
+        st.error(f"Error fetching transcript: {e}")
+        return None
+
+def get_embedding(text):
+    """Generates an embedding using Sentence Transformers."""
+    return model.encode(text).tolist()
+
+def generate_embeddings(video_id):
+    """Generates embeddings from a YouTube video transcript."""
+    transcript = extract_transcript(video_id)
+    if not transcript:
+        return None, None
+
+    lines = transcript.split("\n")
+    chunk_size = 5  # Adjust chunk size
+    text_chunks = [" ".join(lines[i:i+chunk_size]) for i in range(0, len(lines), chunk_size)]
+
+    embeddings = np.array([get_embedding(chunk) for chunk in text_chunks], dtype=np.float32)
+    return embeddings, text_chunks  # Return both embeddings and text chunks
+
+def store_embeddings_in_pinecone(embeddings, text_chunks, video_id):
+    """Stores embeddings in Pinecone index."""
+    if embeddings is not None:
+        ids = [f"{video_id}_{i}" for i in range(len(embeddings))]
+
+        # Prepare data for Pinecone (storing text as metadata)
+        data = [
+            (ids[i], embeddings[i].tolist(), {"text": text_chunks[i]})
+            for i in range(len(embeddings))
+        ]
+
+        # Upsert the embeddings into Pinecone
+        index.upsert(vectors=data)
+        st.success(f"Successfully upserted {len(data)} embeddings into Pinecone.")
+
+def search_transcript(user_query, top_k=5):
+    """Searches Pinecone for relevant transcript sections based on a user query."""
+    
+    # Step 1: Convert query to embedding
+    query_embedding = get_embedding(user_query)
+
+    # Step 2: Search Pinecone
+    result = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+
+    # Step 3: Extract relevant text sections
+    retrieved_texts = [match.metadata["text"] for match in result["matches"] if match.metadata and "text" in match.metadata]
+
+    return retrieved_texts
+
+# Streamlit UI
+def main():
+    st.title("YouTube Video Transcript Search")
+
+    # Input for YouTube video ID
+    yt_video_id = st.text_input("Enter YouTube Video ID", "")
+
+    # Input for user query
+    user_query = st.text_input("Enter your question", "")
+
+    if yt_video_id and user_query:
+        st.write(f"Searching for: `{user_query}` in video `{yt_video_id}`...")
+
+        # Generate embeddings and text chunks
+        embeddings, text_chunks = generate_embeddings(yt_video_id)
+
+        if embeddings is not None and len(embeddings) > 0 and text_chunks:
+
+            # Store embeddings in Pinecone
+            store_embeddings_in_pinecone(embeddings, text_chunks, yt_video_id)
+
+            # Retrieve most relevant transcript sections
+            relevant_sections = search_transcript(user_query)
+
+            st.subheader("🔹 Most Relevant Transcript Sections:")
+            if relevant_sections:
+                for idx, section in enumerate(relevant_sections, 1):
+                    st.write(f"{idx}. {section}\n")
+            else:
+                st.write("No matching transcript sections found.")
+        else:
+            st.write("Failed to generate embeddings. Please check the YouTube video ID.")
+    else:
+        st.write("Please enter a YouTube video ID and a query to start the search.")
+
+if __name__ == "__main__":
+    main()
