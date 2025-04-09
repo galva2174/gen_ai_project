@@ -608,7 +608,7 @@ def process_query(question: str, video_url: str = "", mode: str = "RAG", prompti
                     else:
                         should_expand = system.video_embedding_manager.should_expand_knowledge(relevance_scores)
                         if should_expand:
-                            print(f"Expanding knowledge with video: {video_id}")
+                            print(f"Expanding knowledge with video as relevance score of existing knowledge base is low: {video_id}")
                             system.video_embedding_manager.process_video(video_url)
                             relevant_chunks = system.retrieve_relevant_chunks(query_embedding)
                 except Exception as e:
@@ -648,7 +648,7 @@ def process_query(question: str, video_url: str = "", mode: str = "RAG", prompti
             sources_text += "Video Context:\n" + video_context
             
             if should_expand:
-                sources_text += "\n\n[Knowledge base was expanded with this video]"
+                sources_text += "\n\n[Knowledge base was expanded with this video as relevance score of existing knowledge base is low]"
         
         return answer, sources_text, video_url
     except Exception as e:
