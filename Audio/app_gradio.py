@@ -16,16 +16,14 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from video_embeddings import VideoEmbeddingManager
 import asyncio
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import requests
 import json
-import pyaudio  # Add PyAudio import
-import wave     # Add wave import
-import tempfile  # Add tempfile import
-# Add transformers and PEFT libraries for the HuggingFace model
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel, PeftConfig
+import pyaudio
+import wave
+import tempfile
+from groq import Groq
 
 # Load environment variables
 load_dotenv()
@@ -89,51 +87,41 @@ custom_css = """
 """
 
 class BaseSystem:
-    def __init__(self, pinecone_api_key: str, index_name: str,
-                 model_name: str = "sentence-transformers/all-mpnet-base-v2"):
+    def __init__(self, pinecone_api_key: str, groq_api_key: str, index_name: str,
+                 model_name: str = "sentence-transformers/all-mpnet-base-v2"):  # Changed back to match Pinecone index dimension
         """
-        Initialize base system with Pinecone and models.
+        Initialize base system with Pinecone, Groq, and models.
         """
         # Initialize Pinecone client
         self.pc = pinecone.Pinecone(api_key=pinecone_api_key)
         self.index = self.pc.Index(index_name)
 
-        # Initialize HuggingFace model and tokenizer
-        self.hf_model_id = "rishikann/qa_finetuned_model"
-        
+        # Initialize Groq client
+        self.groq_client = Groq(api_key=groq_api_key)
+
         # Check for GPU availability
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device}")
 
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer(model_name).to(self.device)
+        # Initialize embedding model with error handling
+        try:
+            print("Loading sentence transformer model...")
+            self.embedding_model = SentenceTransformer(model_name, device=self.device)
+            print(f"Successfully loaded model: {model_name}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            return
 
         # Set parameters
         self.top_k = 1  # Retrieve only the top source
 
-        # Initialize VideoEmbeddingManager
+        # Initialize VideoEmbeddingManager with the same model
         self.video_embedding_manager = VideoEmbeddingManager(
             pinecone_api_key=pinecone_api_key,
             index_name=index_name,
             model_name=model_name
         )
-        
-        try:
-            # Initialize HuggingFace model and tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model_id)
-            
-            # Load the base model with the adapter (finetuned model)
-            self.hf_model = AutoModelForCausalLM.from_pretrained(
-                self.hf_model_id, 
-                device_map=self.device,
-                torch_dtype=torch.float16 if self.device == 'cuda' else torch.float32
-            )
-            print(f"Successfully loaded finetuned model: {self.hf_model_id}")
-        except Exception as e:
-            print(f"Error loading HuggingFace model: {e}")
-            self.hf_model = None
-            self.tokenizer = None
-        
+
         # Initialize YouTube API client
         youtube_api_key = os.getenv('YOUTUBE_API_KEY')
         if youtube_api_key:
@@ -340,9 +328,6 @@ class EnhancedRAGSystem(BaseSystem):
         if not relevant_chunks and not video_context:
             return "I couldn't find sufficient information to answer your question."
 
-        if not self.hf_model or not self.tokenizer:
-            return "The finetuned model could not be loaded. Please check the model configuration."
-
         context = ""
         if relevant_chunks:
             context += f"Knowledge Base Context:\n{relevant_chunks[0]['text']}\n\n"
@@ -361,21 +346,19 @@ class EnhancedRAGSystem(BaseSystem):
         # Format the input for the model
         model_input = f"{self.system_prompt}\n\nUser: {prompt}\n\nAssistant:"
         
-        # Tokenize the input
-        inputs = self.tokenizer(model_input, return_tensors="pt").to(self.device)
-        
-        # Generate the answer
-        with torch.no_grad():
-            outputs = self.hf_model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.7,
-                top_p=0.95,
-                do_sample=True
-            )
-        
-        # Decode the answer
-        answer = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        # Generate the answer using Groq
+        response = self.groq_client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": model_input}
+            ],
+            max_tokens=512,
+            temperature=0.7,
+            top_p=0.95
+        )
+
+        answer = response.choices[0].message.content.strip()
         
         return answer
 
@@ -447,53 +430,70 @@ class EnhancedRAGSystem(BaseSystem):
         """
 
 class AgentSystem(BaseSystem):
+    def __init__(self, pinecone_api_key: str, groq_api_key: str, index_name: str):
+        super().__init__(pinecone_api_key=pinecone_api_key, groq_api_key=groq_api_key, index_name=index_name)
+        self.orchestrator = None
+        self.initialize_agents()
+
+    def initialize_agents(self):
+        """Initialize the agent system with all required agents"""
+        try:
+            # Create all agents
+            self.embedding_agent = EmbeddingAgent()
+            self.retrieval_agent = RetrievalAgent(self.pc, self.index)
+            self.transcript_agent = TranscriptAgent()
+            self.llm_agent = LLMAgent(self.groq_client.api_key)  # Use api_key instead of _api_key
+            self.formatting_agent = FormattingAgent()
+
+            # Create and configure orchestration agent
+            self.orchestrator = OrchestrationAgent()
+            self.orchestrator.register_agent("embedding", self.embedding_agent)
+            self.orchestrator.register_agent("retrieval", self.retrieval_agent)
+            self.orchestrator.register_agent("transcript", self.transcript_agent)
+            self.orchestrator.register_agent("llm", self.llm_agent)
+            self.orchestrator.register_agent("formatting", self.formatting_agent)
+
+            print(f"AgentSystem initialized with {len(self.orchestrator.agents)} specialized agents")
+        except Exception as e:
+            print(f"Error initializing agents: {e}")
+
     def generate_answer(self, query: str, relevant_chunks: List[Dict[str, Any]], video_context: str = "", prompting_technique: str = "standard") -> str:
-        """Generate a comprehensive answer using the finetuned model with agent capabilities."""
-        if not relevant_chunks and not video_context:
-            return "I couldn't find sufficient information to answer your question."
+        """Generate a comprehensive answer using the agent system."""
+        if not self.orchestrator:
+            return super().generate_answer(query, relevant_chunks, video_context, prompting_technique)
 
-        if not self.hf_model or not self.tokenizer:
-            return "The finetuned model could not be loaded. Please check the model configuration."
+        try:
+            context = ""
+            if relevant_chunks:
+                context += f"Knowledge Base Context:\n{relevant_chunks[0]['text']}\n\n"
+            if video_context:
+                context += f"Video Context:\n{video_context}\n\n"
 
-        context = ""
-        if relevant_chunks:
-            context += f"Knowledge Base Context:\n{relevant_chunks[0]['text']}\n\n"
-        if video_context:
-            context += f"Video Context:\n{video_context}\n\n"
+            # Create base prompt based on prompting technique
+            if prompting_technique.lower() == "cot":
+                prompt = self._generate_cot_prompt(query, context)
+            elif prompting_technique.lower() == "tot":
+                prompt = self._generate_tot_prompt(query, context)
+            elif prompting_technique.lower() == "got":
+                prompt = self._generate_got_prompt(query, context)
+            else:
+                prompt = self._generate_standard_prompt(query, context)
 
-        if prompting_technique.lower() == "cot":
-            prompt = self._generate_cot_prompt(query, context)
-        elif prompting_technique.lower() == "tot":
-            prompt = self._generate_tot_prompt(query, context)
-        elif prompting_technique.lower() == "got":
-            prompt = self._generate_got_prompt(query, context)
-        else:
-            prompt = self._generate_standard_prompt(query, context)
-
-        # Format the input for the model
-        model_input = f"{self.system_prompt}\n\nUser: {prompt}\n\nAssistant:"
-        
-        # Tokenize the input
-        inputs = self.tokenizer(model_input, return_tensors="pt").to(self.device)
-        
-        # Generate the answer
-        with torch.no_grad():
-            outputs = self.hf_model.generate(
-                **inputs,
-                max_new_tokens=1024,
-                temperature=0.3,
-                top_p=0.9,
-                do_sample=True
-            )
-        
-        # Decode the answer
-        answer = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        
-        return answer
+            # Process query through orchestrator with the generated prompt
+            result = self.orchestrator.process(prompt, None)
+            
+            if result and result.get("success", False):
+                return result["answer"]
+            else:
+                return "I encountered an error while processing your question. Please try again."
+                
+        except Exception as e:
+            print(f"Error in agent system answer generation: {e}")
+            return super().generate_answer(query, relevant_chunks, video_context, prompting_technique)
 
     def _generate_standard_prompt(self, query: str, context: str) -> str:
         return f"""
-        You are an advanced AI agent capable of complex reasoning and problem-solving. Analyze the question and context carefully.
+        You are an advanced AI agent capable of complex reasoning and problem-solving. Your task is to analyze the question and context carefully to provide a detailed, well-reasoned answer.
 
         USER QUESTION:
         {query}
@@ -507,8 +507,8 @@ class AgentSystem(BaseSystem):
         3. Provides additional insights
         4. Considers multiple perspectives
         5. Explains the reasoning process
-        6. Identifies information gaps
-        7. Suggests follow-up areas
+        6. Identifies any gaps in the available information
+        7. Suggests potential follow-up areas
 
         Your answer should be structured, clear, and demonstrate deep understanding.
         """
@@ -544,7 +544,7 @@ class AgentSystem(BaseSystem):
            - Completeness assessment
            - Clarity enhancement
 
-        Based on this analysis, here's the comprehensive answer:
+        Based on this analysis, provide a comprehensive answer.
         """
 
     def _generate_tot_prompt(self, query: str, context: str) -> str:
@@ -577,7 +577,7 @@ class AgentSystem(BaseSystem):
         - Novel insights
         - Future implications
 
-        After evaluating all paths, here's the optimal solution:
+        After evaluating all paths, synthesize the optimal solution.
         """
 
     def _generate_got_prompt(self, query: str, context: str) -> str:
@@ -612,19 +612,221 @@ class AgentSystem(BaseSystem):
            - Insight generation
            - Practical implications
 
-        Based on this network analysis, here's the comprehensive solution:
+        Based on this network analysis, provide a comprehensive solution.
         """
+
+# Agent classes
+class Agent:
+    """Base class for all agents in the system"""
+    def __init__(self, name: str):
+        self.name = name
+
+    def process(self, *args, **kwargs):
+        """Process method to be implemented by each agent"""
+        raise NotImplementedError("Each agent must implement a process method")
+
+    def log(self, message: str):
+        """Simple logging method"""
+        print(f"[{self.name}] {message}")
+
+class EmbeddingAgent(Agent):
+    """Agent responsible for text embeddings and preprocessing"""
+    def __init__(self, model_name: str = "sentence-transformers/all-mpnet-base-v2"):  # Ensure consistent model usage
+        super().__init__("Embedding Agent")
+        try:
+            print("Loading sentence transformer model...")
+            self.embedding_model = SentenceTransformer(model_name)
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.embedding_model = self.embedding_model.to(self.device)
+            print(f"Successfully loaded model: {model_name}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise  # Re-raise as we can't proceed without a model
+
+    def process(self, text: str) -> List[float]:
+        """Generate embedding for the given text."""
+        self.log(f"Generating embedding for text: {text[:50]}...")
+        return self.embedding_model.encode(text).tolist()
+
+class RetrievalAgent(Agent):
+    """Agent responsible for retrieving relevant information from Pinecone"""
+    def __init__(self, pc, index):
+        super().__init__("Retrieval Agent")
+        self.pc = pc
+        self.index = index
+
+    def process(self, query_embedding: List[float], top_k: int = 1) -> List[Dict[str, Any]]:
+        """Retrieve relevant chunks from Pinecone."""
+        self.log(f"Retrieving top {top_k} matches from Pinecone")
+        query_response = self.index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        return [{
+            'score': match.score,
+            'text': match.metadata.get('text_sample', 'No text available'),
+            'video_id': match.metadata.get('video_id', None)
+        } for match in query_response['matches']]
+
+class TranscriptAgent(Agent):
+    """Agent responsible for handling YouTube transcripts"""
+    def __init__(self):
+        super().__init__("Transcript Agent")
+
+    def process(self, video_id: str) -> Optional[str]:
+        """Get transcript from YouTube video."""
+        try:
+            self.log(f"Fetching transcript for video: {video_id}")
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return ' '.join([entry['text'] for entry in transcript])
+        except Exception as e:
+            self.log(f"Error getting transcript: {e}")
+            return None
+
+class LLMAgent(Agent):
+    """Agent responsible for generating answers using Groq"""
+    def __init__(self, api_key: str):
+        super().__init__("LLM Agent")
+        self.groq_client = Groq(api_key=api_key)  # Initialize with api_key parameter
+        self.model = "llama3-70b-8192"
+
+    def process(self, query: str, context: str) -> Dict[str, Any]:
+        """Generate an answer using Groq."""
+        try:
+            self.log(f"Generating answer for query: {query[:50]}...")
+            
+            prompt = f"""You are an educational AI assistant. Answer the following question using the provided context.
+            
+            CONTEXT:
+            {context}
+
+            QUESTION:
+            {query}
+
+            Provide a clear, accurate, and well-structured answer."""
+
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a knowledgeable educational assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=512,
+                temperature=0.7,
+                top_p=0.95
+            )
+
+            answer = response.choices[0].message.content.strip()
+            return {"answer": answer, "success": True}
+        except Exception as e:
+            self.log(f"Error generating answer: {e}")
+            return {"answer": "Error generating response", "success": False}
+
+class FormattingAgent(Agent):
+    """Agent responsible for formatting responses"""
+    def __init__(self):
+        super().__init__("Formatting Agent")
+
+    def process(self, result: Dict[str, Any]) -> str:
+        """Format the result into a well-structured response."""
+        self.log("Formatting response")
+        response = []
+
+        if "question" in result:
+            response.append(f"Q: {result['question']}")
+
+        if "answer" in result:
+            response.append(f"\nA: {result['answer']}")
+
+        if "source" in result and result["source"]:
+            source = result["source"]
+            response.append("\nSource:")
+            response.append(f"Relevance Score: {source['score']:.2f}")
+            response.append(f"Content: {source['text']}")
+
+        if "video_transcript" in result and result["video_transcript"]:
+            response.append("\nVideo Transcript Excerpt:")
+            transcript = result["video_transcript"][:500] + "..."  # First 500 chars
+            response.append(transcript)
+
+        return "\n".join(response)
+
+# Add OrchestrationAgent class
+class OrchestrationAgent(Agent):
+    """Agent responsible for orchestrating the overall workflow"""
+    def __init__(self):
+        super().__init__("Orchestration Agent")
+        self.agents = {}
+        self.executor = ThreadPoolExecutor(max_workers=3)
+
+    def register_agent(self, agent_type: str, agent: Agent):
+        """Register an agent to be used in the workflow"""
+        self.agents[agent_type] = agent
+        self.log(f"Registered {agent.name}")
+
+    def process(self, question: str, video_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Orchestrate the workflow to process a user query
+        """
+        self.log(f"Starting workflow for question: '{question}'")
+        
+        try:
+            # Generate embedding for the question
+            query_embedding = self.agents["embedding"].process(question)
+
+            # Get transcript if video_id is provided
+            transcript = None
+            if video_id:
+                transcript = self.agents["transcript"].process(video_id)
+
+            # Retrieve relevant chunks
+            relevant_chunks = self.agents["retrieval"].process(query_embedding)
+
+            # Prepare context for LLM
+            context = ""
+            if relevant_chunks:
+                context += relevant_chunks[0]['text']
+            if transcript:
+                context += f"\n\nVideo Transcript:\n{transcript}"
+
+            # Generate answer
+            answer_result = self.agents["llm"].process(question, context)
+
+            # Format result
+            result = {
+                "question": question,
+                "answer": answer_result["answer"],
+                "source": relevant_chunks[0] if relevant_chunks else None,
+                "video_transcript": transcript,
+                "success": answer_result["success"]
+            }
+
+            formatted_response = self.agents["formatting"].process(result)
+            result["formatted_response"] = formatted_response
+
+            return result
+
+        except Exception as e:
+            self.log(f"Error in workflow: {e}")
+            return {
+                "answer": "An error occurred while processing your question",
+                "success": False
+            }
 
 def create_system(mode: str):
     """Create and return the appropriate system based on mode."""
     if mode.lower() == "rag":
         return EnhancedRAGSystem(
             pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+            groq_api_key=os.getenv('GROQ_API_KEY'),
             index_name=os.getenv('PINECONE_INDEX_NAME', 'embeddings')
         )
     else:
         return AgentSystem(
             pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+            groq_api_key=os.getenv('GROQ_API_KEY'),
             index_name=os.getenv('PINECONE_INDEX_NAME', 'embeddings')
         )
 
