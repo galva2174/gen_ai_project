@@ -46,10 +46,12 @@ The system consists of several integrated components:
 
 ### Technical Flow
 
-1. User submits a query (text or voice)
+1. User submits a query with a video URL (text or voice)
 2. System generates embeddings for the query
 3. Relevant information is retrieved from Pinecone vector database
-4. If knowledge is insufficient:
+4. If knowledge in the YouTube video is insufficient, relevance is low (avg < 0.55):
+   - knowledge is expanded, relevant chunks are re-retrieved to include the new information
+5. If user submits a query without a video URL (text or voice)
    - System searches for relevant YouTube videos
    - Video transcripts are processed and embedded
    - Knowledge base is expanded
