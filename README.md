@@ -11,7 +11,8 @@ A sophisticated educational assistant leveraging Retrieval-Augmented Generation 
   - **Agent Mode**: Advanced reasoning with deeper analysis capabilities
 
 - **Advanced Prompting Techniques**:
-  - Standard reasoning
+  - Auto Reasoning
+  - Standard Reasoning
   - Chain of Thought (CoT)
   - Tree of Thought (ToT) 
   - Graph of Thought (GoT)
@@ -158,6 +159,7 @@ The system implements four distinct prompting strategies:
 2. **Chain of Thought (CoT)**: Step-by-step reasoning process for complex problems
 3. **Tree of Thought (ToT)**: Explores multiple solution paths simultaneously
 4. **Graph of Thought (GoT)**: Maps interconnected concepts and relationships
+5. **Auto**: Automatically selects appropriate prompting technique based on keywords present in user query. 
 
 ## 🌐 Voice Input Functionality
 
@@ -176,10 +178,6 @@ The system intelligently expands its knowledge base when:
 ## 📝 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 👥 Contributors
-
-- [Your Name](https://github.com/yourusername)
 
 ## 🙏 Acknowledgments
 
