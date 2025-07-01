@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 import numpy as np
 import pinecone
 from sentence_transformers import SentenceTransformer
-from groq import Groq
 import torch
 from typing import List, Dict, Any, Optional
 import nltk
@@ -16,9 +15,29 @@ import re
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from video_embeddings import VideoEmbeddingManager
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import requests
+import json
+import pyaudio
+import wave
+import tempfile
+from groq import Groq
 
 # Load environment variables
 load_dotenv()
+
+# AssemblyAI API configuration using requests - Using exact key and parameters from test.py
+API_KEY = "f6b537a6b4f140dfbead28720751b78e"
+HEADERS = {
+    "authorization": API_KEY,
+    "content-type": "application/json"
+}
+API_ENDPOINT = "https://api.assemblyai.com/v2/transcript"
+UPLOAD_ENDPOINT = "https://api.assemblyai.com/v2/upload"
+
+print("AssemblyAI API Key loaded for requests.")
 
 # Custom CSS for dynamic background only
 custom_css = """
@@ -33,11 +52,43 @@ custom_css = """
     background-size: 400% 400%;
     animation: gradient 15s ease infinite;
 }
+
+/* Remove boxes around sections and radio button groups */
+.gradio-radio,
+.gradio-group {
+    border: none !important;
+    box-shadow: none !important;
+}
+
+/* Change color of all input boxes */
+.gradio-textbox input,
+.gradio-textbox textarea,
+.gradio-dropdown,
+.gradio-radio label,
+.gradio-checkbox label,
+.gradio-slider,
+.gradio-checkbox,
+.gradio-button {
+    border-color: #1CA9B3 !important;
+}
+
+.gradio-textbox,
+.gradio-dropdown,
+.gradio-slider,
+.gradio-checkbox,
+.gradio-radio,
+.gradio-button {
+    border-color: #1CA9B3 !important;
+}
+
+.gradio-button {
+    background-color: #1CA9B3 !important;
+}
 """
 
 class BaseSystem:
     def __init__(self, pinecone_api_key: str, groq_api_key: str, index_name: str,
-                 model_name: str = "sentence-transformers/all-mpnet-base-v2"):
+                 model_name: str = "sentence-transformers/all-mpnet-base-v2"):  # Changed back to match Pinecone index dimension
         """
         Initialize base system with Pinecone, Groq, and models.
         """
@@ -52,19 +103,25 @@ class BaseSystem:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device}")
 
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer(model_name).to(self.device)
+        # Initialize embedding model with error handling
+        try:
+            print("Loading sentence transformer model...")
+            self.embedding_model = SentenceTransformer(model_name, device=self.device)
+            print(f"Successfully loaded model: {model_name}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            return
 
         # Set parameters
         self.top_k = 1  # Retrieve only the top source
 
-        # Initialize VideoEmbeddingManager
+        # Initialize VideoEmbeddingManager with the same model
         self.video_embedding_manager = VideoEmbeddingManager(
             pinecone_api_key=pinecone_api_key,
             index_name=index_name,
             model_name=model_name
         )
-        
+
         # Initialize YouTube API client
         youtube_api_key = os.getenv('YOUTUBE_API_KEY')
         if youtube_api_key:
@@ -242,54 +299,19 @@ Remember to:
                 print("No valid videos found.")
                 return None
 
-            formatted_videos = []
-            for v in videos_info:
-                view_info = f"\nViews: {v.get('view_count', 'unknown')}" if 'view_count' in v else ""
-                formatted_videos.append(f"Title: {v['title']}\nDescription: {v['description']}{view_info}\nID: {v['id']}\n")
+            # Simple selection strategy: just take the first video with highest view count
+            # This replaces the LLM-based selection we were doing with Groq
+            for video in videos_info:
+                try:
+                    YouTubeTranscriptApi.get_transcript(video['id'])
+                    return f"https://www.youtube.com/watch?v={video['id']}"
+                except Exception as e:
+                    continue
                 
-            prompt = f"""
-            Analyze these YouTube videos and select the most relevant EDUCATIONAL video for the query: "{query}"
-
-            Videos:
-            {formatted_videos}
-
-            Consider:
-            1. Educational value and learning potential (most important)
-            2. Content structure and teaching methodology
-            3. Accuracy and reliability of information
-            4. Engagement and clarity of explanation
-            5. Relevance to the query
-            6. Number of views (popularity) if available
-
-            Return ONLY the video ID of the most relevant EDUCATIONAL video, nothing else.
-            """
-
-            chat_completion = self.groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You are an educational video selection assistant specialized in identifying high-quality educational content. Return only the video ID."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama3-70b-8192",
-                temperature=0.3,
-                top_p=0.95,
-                max_tokens=20
-            )
-
-            selected_video_id = chat_completion.choices[0].message.content.strip()
-            
-            try:
-                YouTubeTranscriptApi.get_transcript(selected_video_id)
-                return f"https://www.youtube.com/watch?v={selected_video_id}"
-            except Exception as transcript_error:
-                print(f"Selected video doesn't have transcript: {transcript_error}")
-                for video in videos_info:
-                    try:
-                        YouTubeTranscriptApi.get_transcript(video['id'])
-                        return f"https://www.youtube.com/watch?v={video['id']}"
-                    except Exception as e:
-                        continue
-                
-                return f"https://www.youtube.com/watch?v={selected_video_id}"
+            # If we couldn't find a video with transcript, return the first one
+            if videos_info:
+                return f"https://www.youtube.com/watch?v={videos_info[0]['id']}"
+            return None
         
         except HttpError as e:
             print(f"YouTube API HTTP error: {e.resp.status} {e.content}")
@@ -302,7 +324,7 @@ Remember to:
 
 class EnhancedRAGSystem(BaseSystem):
     def generate_answer(self, query: str, relevant_chunks: List[Dict[str, Any]], video_context: str = "", prompting_technique: str = "standard") -> str:
-        """Generate a comprehensive answer using Groq."""
+        """Generate a comprehensive answer using the finetuned model."""
         if not relevant_chunks and not video_context:
             return "I couldn't find sufficient information to answer your question."
 
@@ -321,18 +343,24 @@ class EnhancedRAGSystem(BaseSystem):
         else:
             prompt = self._generate_standard_prompt(query, context)
 
-        chat_completion = self.groq_client.chat.completions.create(
+        # Format the input for the model
+        model_input = f"{self.system_prompt}\n\nUser: {prompt}\n\nAssistant:"
+        
+        # Generate the answer using Groq
+        response = self.groq_client.chat.completions.create(
+            model="llama3-70b-8192",
             messages=[
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": model_input}
             ],
-            model="llama3-70b-8192",
+            max_tokens=512,
             temperature=0.7,
-            top_p=0.95,
-            max_tokens=512
+            top_p=0.95
         )
 
-        return chat_completion.choices[0].message.content
+        answer = response.choices[0].message.content.strip()
+        
+        return answer
 
     def _generate_standard_prompt(self, query: str, context: str) -> str:
         return f"""
@@ -402,42 +430,72 @@ class EnhancedRAGSystem(BaseSystem):
         """
 
 class AgentSystem(BaseSystem):
+    def __init__(self, pinecone_api_key: str, groq_api_key: str, index_name: str):
+        super().__init__(pinecone_api_key=pinecone_api_key, groq_api_key=groq_api_key, index_name=index_name)
+        self.orchestrator = None
+        self.initialize_agents()
+
+    def initialize_agents(self):
+        """Initialize the agent system with all required agents"""
+        try:
+            # Create all agents
+            self.embedding_agent = EmbeddingAgent()
+            self.retrieval_agent = RetrievalAgent(self.pc, self.index)
+            self.transcript_agent = TranscriptAgent()
+            self.llm_agent = LLMAgent(self.groq_client.api_key)  # Use api_key instead of _api_key
+            self.formatting_agent = FormattingAgent()
+            self.prompting_strategy_agent = PromptingStrategyAgent()
+            self.orchestrator.register_agent("prompting_strategy", self.prompting_strategy_agent)
+
+            # Create and configure orchestration agent
+            self.orchestrator = OrchestrationAgent()
+            self.orchestrator.register_agent("embedding", self.embedding_agent)
+            self.orchestrator.register_agent("retrieval", self.retrieval_agent)
+            self.orchestrator.register_agent("transcript", self.transcript_agent)
+            self.orchestrator.register_agent("llm", self.llm_agent)
+            self.orchestrator.register_agent("formatting", self.formatting_agent)
+
+            print(f"AgentSystem initialized with {len(self.orchestrator.agents)} specialized agents")
+        except Exception as e:
+            print(f"Error initializing agents: {e}")
+
     def generate_answer(self, query: str, relevant_chunks: List[Dict[str, Any]], video_context: str = "", prompting_technique: str = "standard") -> str:
-        """Generate a comprehensive answer using Groq with agent capabilities."""
-        if not relevant_chunks and not video_context:
-            return "I couldn't find sufficient information to answer your question."
+        """Generate a comprehensive answer using the agent system."""
+        if not self.orchestrator:
+            return super().generate_answer(query, relevant_chunks, video_context, prompting_technique)
 
-        context = ""
-        if relevant_chunks:
-            context += f"Knowledge Base Context:\n{relevant_chunks[0]['text']}\n\n"
-        if video_context:
-            context += f"Video Context:\n{video_context}\n\n"
+        try:
+            context = ""
+            if relevant_chunks:
+                context += f"Knowledge Base Context:\n{relevant_chunks[0]['text']}\n\n"
+            if video_context:
+                context += f"Video Context:\n{video_context}\n\n"
 
-        if prompting_technique.lower() == "cot":
-            prompt = self._generate_cot_prompt(query, context)
-        elif prompting_technique.lower() == "tot":
-            prompt = self._generate_tot_prompt(query, context)
-        elif prompting_technique.lower() == "got":
-            prompt = self._generate_got_prompt(query, context)
-        else:
-            prompt = self._generate_standard_prompt(query, context)
+            # Create base prompt based on prompting technique
+            if prompting_technique.lower() == "cot":
+                prompt = self._generate_cot_prompt(query, context)
+            elif prompting_technique.lower() == "tot":
+                prompt = self._generate_tot_prompt(query, context)
+            elif prompting_technique.lower() == "got":
+                prompt = self._generate_got_prompt(query, context)
+            else:
+                prompt = self._generate_standard_prompt(query, context)
 
-        chat_completion = self.groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama3-70b-8192",
-            temperature=0.3,
-            top_p=0.9,
-            max_tokens=1024
-        )
-
-        return chat_completion.choices[0].message.content
+            # Process query through orchestrator with the generated prompt
+            result = self.orchestrator.process(prompt, None)
+            
+            if result and result.get("success", False):
+                return result["answer"]
+            else:
+                return "I encountered an error while processing your question. Please try again."
+                
+        except Exception as e:
+            print(f"Error in agent system answer generation: {e}")
+            return super().generate_answer(query, relevant_chunks, video_context, prompting_technique)
 
     def _generate_standard_prompt(self, query: str, context: str) -> str:
         return f"""
-        You are an advanced AI agent capable of complex reasoning and problem-solving. Analyze the question and context carefully.
+        You are an advanced AI agent capable of complex reasoning and problem-solving. Your task is to analyze the question and context carefully to provide a detailed, well-reasoned answer.
 
         USER QUESTION:
         {query}
@@ -451,8 +509,8 @@ class AgentSystem(BaseSystem):
         3. Provides additional insights
         4. Considers multiple perspectives
         5. Explains the reasoning process
-        6. Identifies information gaps
-        7. Suggests follow-up areas
+        6. Identifies any gaps in the available information
+        7. Suggests potential follow-up areas
 
         Your answer should be structured, clear, and demonstrate deep understanding.
         """
@@ -488,7 +546,7 @@ class AgentSystem(BaseSystem):
            - Completeness assessment
            - Clarity enhancement
 
-        Based on this analysis, here's the comprehensive answer:
+        Based on this analysis, provide a comprehensive answer.
         """
 
     def _generate_tot_prompt(self, query: str, context: str) -> str:
@@ -521,7 +579,7 @@ class AgentSystem(BaseSystem):
         - Novel insights
         - Future implications
 
-        After evaluating all paths, here's the optimal solution:
+        After evaluating all paths, synthesize the optimal solution.
         """
 
     def _generate_got_prompt(self, query: str, context: str) -> str:
@@ -556,8 +614,225 @@ class AgentSystem(BaseSystem):
            - Insight generation
            - Practical implications
 
-        Based on this network analysis, here's the comprehensive solution:
+        Based on this network analysis, provide a comprehensive solution.
         """
+
+# Agent classes
+class Agent:
+    """Base class for all agents in the system"""
+    def __init__(self, name: str):
+        self.name = name
+
+    def process(self, *args, **kwargs):
+        """Process method to be implemented by each agent"""
+        raise NotImplementedError("Each agent must implement a process method")
+
+    def log(self, message: str):
+        """Simple logging method"""
+        print(f"[{self.name}] {message}")
+
+class EmbeddingAgent(Agent):
+    """Agent responsible for text embeddings and preprocessing"""
+    def __init__(self, model_name: str = "sentence-transformers/all-mpnet-base-v2"):  # Ensure consistent model usage
+        super().__init__("Embedding Agent")
+        try:
+            print("Loading sentence transformer model...")
+            self.embedding_model = SentenceTransformer(model_name)
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.embedding_model = self.embedding_model.to(self.device)
+            print(f"Successfully loaded model: {model_name}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise  # Re-raise as we can't proceed without a model
+
+    def process(self, text: str) -> List[float]:
+        """Generate embedding for the given text."""
+        self.log(f"Generating embedding for text: {text[:50]}...")
+        return self.embedding_model.encode(text).tolist()
+
+class RetrievalAgent(Agent):
+    """Agent responsible for retrieving relevant information from Pinecone"""
+    def __init__(self, pc, index):
+        super().__init__("Retrieval Agent")
+        self.pc = pc
+        self.index = index
+
+    def process(self, query_embedding: List[float], top_k: int = 1) -> List[Dict[str, Any]]:
+        """Retrieve relevant chunks from Pinecone."""
+        self.log(f"Retrieving top {top_k} matches from Pinecone")
+        query_response = self.index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        return [{
+            'score': match.score,
+            'text': match.metadata.get('text_sample', 'No text available'),
+            'video_id': match.metadata.get('video_id', None)
+        } for match in query_response['matches']]
+
+class TranscriptAgent(Agent):
+    """Agent responsible for handling YouTube transcripts"""
+    def __init__(self):
+        super().__init__("Transcript Agent")
+
+    def process(self, video_id: str) -> Optional[str]:
+        """Get transcript from YouTube video."""
+        try:
+            self.log(f"Fetching transcript for video: {video_id}")
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return ' '.join([entry['text'] for entry in transcript])
+        except Exception as e:
+            self.log(f"Error getting transcript: {e}")
+            return None
+
+class LLMAgent(Agent):
+    """Agent responsible for generating answers using Groq"""
+    def __init__(self, api_key: str):
+        super().__init__("LLM Agent")
+        self.groq_client = Groq(api_key=api_key)  # Initialize with api_key parameter
+        self.model = "llama3-70b-8192"
+
+    def process(self, query: str, context: str) -> Dict[str, Any]:
+        """Generate an answer using Groq."""
+        try:
+            self.log(f"Generating answer for query: {query[:50]}...")
+            
+            prompt = f"""You are an educational AI assistant. Answer the following question using the provided context.
+            
+            CONTEXT:
+            {context}
+
+            QUESTION:
+            {query}
+
+            Provide a clear, accurate, and well-structured answer."""
+
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a knowledgeable educational assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=512,
+                temperature=0.7,
+                top_p=0.95
+            )
+
+            answer = response.choices[0].message.content.strip()
+            return {"answer": answer, "success": True}
+        except Exception as e:
+            self.log(f"Error generating answer: {e}")
+            return {"answer": "Error generating response", "success": False}
+
+class FormattingAgent(Agent):
+    """Agent responsible for formatting responses"""
+    def __init__(self):
+        super().__init__("Formatting Agent")
+
+    def process(self, result: Dict[str, Any]) -> str:
+        """Format the result into a well-structured response."""
+        self.log("Formatting response")
+        response = []
+
+        if "question" in result:
+            response.append(f"Q: {result['question']}")
+
+        if "answer" in result:
+            response.append(f"\nA: {result['answer']}")
+
+        if "source" in result and result["source"]:
+            source = result["source"]
+            response.append("\nSource:")
+            response.append(f"Relevance Score: {source['score']:.2f}")
+            response.append(f"Content: {source['text']}")
+
+        if "video_transcript" in result and result["video_transcript"]:
+            response.append("\nVideo Transcript Excerpt:")
+            transcript = result["video_transcript"][:500] + "..."  # First 500 chars
+            response.append(transcript)
+
+        return "\n".join(response)
+class PromptingStrategyAgent(Agent):
+    """Agent that selects the prompting technique based on the query."""
+    def __init__(self):
+        super().__init__("Prompting Strategy Agent")
+
+    def process(self, question: str) -> str:
+        q = question.lower()
+        if any(word in q for word in ["explain", "why", "how", "reason", "process", "steps"]):
+            return "cot"  # Chain of Thought
+        elif any(word in q for word in ["compare", "alternatives", "pros", "cons", "different", "options"]):
+            return "tot"  # Tree of Thought
+        elif any(word in q for word in ["relationship", "network", "connections", "impact", "influence", "system"]):
+            return "got"  # Graph of Thought
+        else:
+            return "cot"  # Default
+
+# Add OrchestrationAgent class
+class OrchestrationAgent(Agent):
+    """Agent responsible for orchestrating the overall workflow"""
+    def __init__(self):
+        super().__init__("Orchestration Agent")
+        self.agents = {}
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.prompting_strategy_agent = PromptingStrategyAgent()
+        self.register_agent("prompting_strategy", self.prompting_strategy_agent)
+
+    def register_agent(self, agent_type: str, agent: Agent):
+        """Register an agent to be used in the workflow"""
+        self.agents[agent_type] = agent
+        self.log(f"Registered {agent.name}")
+
+    def process(self, question: str, video_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Orchestrate the workflow to process a user query
+        """
+        self.log(f"Starting workflow for question: '{question}'")
+        
+        try:
+            # Generate embedding for the question
+            query_embedding = self.agents["embedding"].process(question)
+
+            # Get transcript if video_id is provided
+            transcript = None
+            if video_id:
+                transcript = self.agents["transcript"].process(video_id)
+
+            # Retrieve relevant chunks
+            relevant_chunks = self.agents["retrieval"].process(query_embedding)
+
+            # Prepare context for LLM
+            context = ""
+            if relevant_chunks:
+                context += relevant_chunks[0]['text']
+            if transcript:
+                context += f"\n\nVideo Transcript:\n{transcript}"
+
+            # Generate answer
+            answer_result = self.agents["llm"].process(question, context)
+
+            # Format result
+            result = {
+                "question": question,
+                "answer": answer_result["answer"],
+                "source": relevant_chunks[0] if relevant_chunks else None,
+                "video_transcript": transcript,
+                "success": answer_result["success"]
+            }
+
+            formatted_response = self.agents["formatting"].process(result)
+            result["formatted_response"] = formatted_response
+
+            return result
+
+        except Exception as e:
+            self.log(f"Error in workflow: {e}")
+            return {
+                "answer": "An error occurred while processing your question",
+                "success": False
+            }
 
 def create_system(mode: str):
     """Create and return the appropriate system based on mode."""
@@ -581,6 +856,13 @@ def process_query(question: str, video_url: str = "", mode: str = "RAG", prompti
     
     try:
         system = create_system(mode)
+
+        # If prompting_technique is 'auto', use the agent to select
+        if prompting_technique == "auto":
+                if hasattr(system, "orchestrator") and "prompting_strategy" in system.orchestrator.agents:
+                    prompting_technique = system.orchestrator.agents["prompting_strategy"].process(question)
+                else:
+                    prompting_technique = "cot"  # fallback
         
         # Generate embedding
         query_embedding = system.embed_query(question)
@@ -654,6 +936,157 @@ def process_query(question: str, video_url: str = "", mode: str = "RAG", prompti
     except Exception as e:
         return f"Error: {str(e)}", "Error retrieving sources.", ""
 
+# Function to record audio using PyAudio (flexible duration)
+def record_audio_pyaudio():
+    """Record audio from microphone with user-controlled start/stop using PyAudio"""
+    chunk = 1024
+    sample_format = pyaudio.paInt16
+    channels = 1
+    fs = 44100
+    
+    # Create a temporary file to store the recording
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    filename = temp_file.name
+    temp_file.close()
+    
+    # Global variable to store the current state
+    global recording_state
+    recording_state = {"is_recording": False, "frames": [], "stream": None, "p": None}
+    
+    return "Ready to start recording"
+
+# Start recording function
+def start_recording():
+    """Start the recording process"""
+    global recording_state
+    
+    if recording_state["is_recording"]:
+        return "Already recording..."
+    
+    chunk = 1024
+    sample_format = pyaudio.paInt16
+    channels = 1
+    fs = 44100
+    
+    recording_state["frames"] = []
+    recording_state["p"] = pyaudio.PyAudio()
+    recording_state["stream"] = recording_state["p"].open(
+        format=sample_format,
+        channels=channels,
+        rate=fs,
+        frames_per_buffer=chunk,
+        input=True
+    )
+    recording_state["is_recording"] = True
+    
+    # Start recording in a background thread
+    def record_thread():
+        while recording_state["is_recording"]:
+            data = recording_state["stream"].read(chunk)
+            recording_state["frames"].append(data)
+    
+    import threading
+    threading.Thread(target=record_thread, daemon=True).start()
+    
+    return "Recording in progress... Press 'Stop Recording' when finished."
+
+# Stop recording function
+def stop_recording():
+    """Stop the recording process and save the audio file"""
+    global recording_state
+    
+    if not recording_state["is_recording"]:
+        return "Not currently recording.", ""
+    
+    recording_state["is_recording"] = False
+    
+    if recording_state["stream"]:
+        recording_state["stream"].stop_stream()
+        recording_state["stream"].close()
+    
+    if recording_state["p"]:
+        recording_state["p"].terminate()
+    
+    # Create a temporary file
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    filename = temp_file.name
+    temp_file.close()
+    
+    if recording_state["frames"]:
+        wf = wave.open(filename, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(recording_state["p"].get_sample_size(pyaudio.paInt16))
+        wf.setframerate(44100)
+        wf.writeframes(b''.join(recording_state["frames"]))
+        wf.close()
+        
+        print(f"Audio saved to: {filename}")
+        
+        # Transcribe the audio
+        transcription = transcribe_audio_assemblyai(filename)
+        
+        # Clean up the temporary file
+        try:
+            os.remove(filename)
+        except:
+            pass
+            
+        return "Recording complete. Transcription done.", transcription
+    else:
+        return "No audio was recorded. Please try again.", ""
+
+# Toggle recording function for single button
+def toggle_recording(button_text):
+    """Toggle between recording start and stop"""
+    if button_text == "🎙️ Start Recording":
+        # Start recording
+        result_status = start_recording()
+        return "⏹️ Stop Recording", result_status, ""
+    else:
+        # Stop recording
+        result_status, transcription = stop_recording()
+        return "🎙️ Start Recording", result_status, transcription
+
+# Function to transcribe audio using AssemblyAI with code directly from test.py
+def transcribe_audio_assemblyai(audio_file):
+    """Send audio file to AssemblyAI for transcription, using the exact same code from test.py"""
+    print("Uploading audio file...")
+    
+    # Upload the audio file to AssemblyAI
+    with open(audio_file, "rb") as f:
+        response = requests.post(UPLOAD_ENDPOINT, headers=HEADERS, data=f)
+    
+    audio_url = response.json()["upload_url"]
+    print(f"Audio file uploaded: {audio_url}")
+    
+    # Request transcription
+    transcript_request = {
+        "audio_url": audio_url,
+        "language_code": "en"  # Change if needed
+    }
+    
+    response = requests.post(API_ENDPOINT, json=transcript_request, headers=HEADERS)
+    transcript_id = response.json()["id"]
+    print(f"Transcription job submitted with ID: {transcript_id}")
+    
+    # Poll for transcription completion
+    polling_endpoint = f"{API_ENDPOINT}/{transcript_id}"
+    
+    print("Waiting for transcription to complete...")
+    while True:
+        response = requests.get(polling_endpoint, headers=HEADERS)
+        status = response.json()["status"]
+        
+        if status == "completed":
+            text = response.json()["text"]
+            print(f"Transcription completed: '{text}'")
+            return text
+        elif status == "error":
+            print("Transcription error occurred.")
+            return "Transcription error occurred."
+        
+        time.sleep(1)
+
 # Create Gradio interface
 with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown("""
@@ -670,14 +1103,31 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
                 info="RAG: Standard retrieval-augmented generation. Agent: Advanced reasoning with deeper analysis."
             )
             prompting_technique = gr.Radio(
-                choices=["standard", "cot", "tot", "got"],
-                value="standard",
+                choices=["auto", "standard", "cot", "tot", "got"],
+                value="auto",
                 label="Prompting Technique",
-                info="standard: Basic reasoning, cot: Chain of Thought, tot: Tree of Thought, got: Graph of Thought"
+                info="auto: Let the system choose, standard: Basic reasoning, cot: Chain of Thought, tot: Tree of Thought, got: Graph of Thought"
             )
+            
+            # Voice Input Section
+            gr.Markdown("""
+            ### 🎙️ Voice Input
+            Click 'Start Recording' to begin, then 'Stop Recording' when finished speaking.
+            Speak clearly into your microphone at a normal volume.
+            """)
+            
+            # Create a toggle button for start and stop
+            toggle_btn = gr.Button("🎙️ Start Recording", variant="primary")
+            
+            recording_status = gr.Textbox(
+                label="Recording Status",
+                value="Ready to record",
+                interactive=False
+            )
+            
             question_input = gr.Textbox(
                 label="Your Question",
-                placeholder="Type your question here...",
+                placeholder="Type your question here or use voice recording above...",
                 lines=2
             )
             video_url_input = gr.Textbox(
@@ -707,6 +1157,16 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
                 show_copy_button=True
             )
     
+    # Initialize recording state
+    recording_state = {"is_recording": False, "frames": [], "stream": None, "p": None}
+    
+    # Set up the event handlers
+    toggle_btn.click(
+        fn=toggle_recording, 
+        inputs=toggle_btn,
+        outputs=[toggle_btn, recording_status, question_input]
+    )
+
     # Handle submission
     submit_btn.click(
         fn=process_query,
